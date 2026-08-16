@@ -9,20 +9,25 @@ set -Eeuo pipefail
 #   - Separate Python venv
 #   - PyTorch 2.9.1 + TorchVision 0.24.1 (CUDA 12.8 wheels)
 #   - Current backend dependencies
-#   - All MangaJaNai / IllustrationJaNai models by extracting
-#     them from the latest official Windows Portable release
+#   - Official MangaJaNai V1 manga models directly from the
+#     official MangaJaNai model release
+#   - IllustrationJaNai V1 models by default (optional)
 #
 # Main paths:
 #   /workspace/MangaJaNai/repo
 #   /workspace/MangaJaNai/venv
 #   /workspace/MangaJaNai/input
 #   /workspace/MangaJaNai/output
+#   /workspace/MangaJaNai/downloads
 #
 # Usage after provisioning:
 #   /workspace/MangaJaNai/mangajanai.sh -h
 #   /workspace/MangaJaNai/mangajanai.sh \
 #       -d /workspace/MangaJaNai/input \
 #       -o /workspace/MangaJaNai/output
+#
+# Set MANGAJANAI_INCLUDE_ILLUSTRATION=0 to skip the extra
+# IllustrationJaNai V1 model archive.
 # ============================================================
 
 ROOT="${MANGAJANAI_ROOT:-/workspace/MangaJaNai}"
@@ -30,10 +35,16 @@ REPO_DIR="${ROOT}/repo"
 VENV_DIR="${ROOT}/venv"
 INPUT_DIR="${ROOT}/input"
 OUTPUT_DIR="${ROOT}/output"
+DOWNLOAD_DIR="${ROOT}/downloads"
 
 REPO_URL="https://github.com/the-database/MangaJaNaiConverterGui.git"
 BACKEND_SRC="${REPO_DIR}/MangaJaNaiConverterGui/backend/src"
 MODELS_DIR="${REPO_DIR}/MangaJaNaiConverterGui/backend/models"
+
+MANGAJANAI_INCLUDE_ILLUSTRATION="${MANGAJANAI_INCLUDE_ILLUSTRATION:-1}"
+
+MANGA_MODELS_URL="https://github.com/the-database/MangaJaNai/releases/download/1.0.0/MangaJaNai_V1_ModelsOnly.zip"
+ILLUSTRATION_MODELS_URL="https://github.com/the-database/MangaJaNai/releases/download/1.0.0/IllustrationJaNai_V1_ModelsOnly.zip"
 
 log() {
     echo
@@ -53,11 +64,10 @@ die() {
 log "Installing system packages"
 
 export DEBIAN_FRONTEND=noninteractive
-
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     apt-get install -y --no-install-recommends \
-        git curl ca-certificates unzip p7zip-full \
+        git curl ca-certificates unzip \
         python3 python3-venv \
         libgl1 libglib2.0-0
     rm -rf /var/lib/apt/lists/*
@@ -67,6 +77,7 @@ fi
 
 command -v git >/dev/null 2>&1 || die "git is not installed"
 command -v curl >/dev/null 2>&1 || die "curl is not installed"
+command -v unzip >/dev/null 2>&1 || die "unzip is not installed"
 
 # Prefer AI-Dock's Python when present; otherwise use the template's python3.
 if [[ -x "/venv/main/bin/python" ]]; then
@@ -84,7 +95,11 @@ fi
 echo "[MangaJaNai] Base Python: ${BASE_PYTHON}"
 "${BASE_PYTHON}" --version
 
-mkdir -p "${ROOT}" "${INPUT_DIR}" "${OUTPUT_DIR}"
+mkdir -p \
+    "${ROOT}" \
+    "${INPUT_DIR}" \
+    "${OUTPUT_DIR}" \
+    "${DOWNLOAD_DIR}"
 
 # ------------------------------------------------------------
 # 1. Clone/update official MangaJaNaiConverterGui
@@ -120,13 +135,6 @@ echo "[MangaJaNai] Python: $("${PY}" --version 2>&1)"
 
 # ------------------------------------------------------------
 # 3. Install CUDA PyTorch explicitly
-#
-# Current MangaJaNai backend pins:
-#   torch==2.9.1
-#   torchvision==0.24.1
-#
-# The repo's old [tool.uv.pip] cu121 URL is stale for current
-# PyTorch 2.9.1, so install the official CUDA 12.8 wheels first.
 # ------------------------------------------------------------
 log "Installing PyTorch 2.9.1 + CUDA 12.8"
 
@@ -137,10 +145,6 @@ log "Installing PyTorch 2.9.1 + CUDA 12.8"
 
 # ------------------------------------------------------------
 # 4. Install the backend package and its non-Torch dependencies
-#
-# These versions mirror the current official pyproject.toml.
-# We install them explicitly so pip cannot replace CUDA Torch
-# with a CPU build during dependency resolution.
 # ------------------------------------------------------------
 log "Installing MangaJaNai backend dependencies"
 
@@ -161,169 +165,150 @@ log "Installing MangaJaNai backend dependencies"
 "${PIP}" install --no-deps "${BACKEND_SRC}"
 
 # ------------------------------------------------------------
-# 5. Download all current official models
+# 5. Download official model archives DIRECTLY
 #
-# Official Linux docs say the CLI expects all models in:
+# IMPORTANT:
+# Do NOT try to extract models from the Windows GUI Portable ZIP
+# or Setup EXE. The actual official model release already provides
+# dedicated ModelsOnly archives.
+#
+# Official CLI docs expect MangaJaNai models in:
 #   MangaJaNaiConverterGui/backend/models
-#
-# The official release bundles them, so fetch the latest Portable
-# ZIP and extract only its backend/models tree.
 # ------------------------------------------------------------
-log "Downloading latest official MangaJaNai model bundle"
+log "Downloading official MangaJaNai models"
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
+mkdir -p "${MODELS_DIR}" "${DOWNLOAD_DIR}"
 
-export TMP_DIR
-ASSET_INFO="$("${PY}" - <<'PY'
-import json
-import urllib.request
+MANGA_ZIP="${DOWNLOAD_DIR}/MangaJaNai_V1_ModelsOnly.zip"
+ILLUSTRATION_ZIP="${DOWNLOAD_DIR}/IllustrationJaNai_V1_ModelsOnly.zip"
 
-api = "https://api.github.com/repos/the-database/MangaJaNaiConverterGui/releases/latest"
-req = urllib.request.Request(
-    api,
-    headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "MangaJaNai-Vast-Provisioner",
-    },
-)
+download_zip() {
+    local url="$1"
+    local dest="$2"
+    local label="$3"
 
-with urllib.request.urlopen(req, timeout=30) as r:
-    data = json.load(r)
-
-portable = ""
-setup = ""
-
-for a in data.get("assets", []):
-    name = (a.get("name") or "")
-    low = name.lower()
-    url = a.get("browser_download_url") or ""
-
-    if "portable" in low and low.endswith(".zip") and not portable:
-        portable = url
-
-    if low.endswith(".exe") and ("setup" in low or "installer" in low) and not setup:
-        setup = url
-
-print(data.get("tag_name", "unknown"))
-print(portable)
-print(setup)
-PY
-)" || die "Failed to discover latest release assets"
-
-LATEST_TAG="$(printf '%s\n' "${ASSET_INFO}" | sed -n '1p')"
-PORTABLE_URL="$(printf '%s\n' "${ASSET_INFO}" | sed -n '2p')"
-SETUP_URL="$(printf '%s\n' "${ASSET_INFO}" | sed -n '3p')"
-
-echo "[MangaJaNai] Latest release: ${LATEST_TAG}"
-echo "[MangaJaNai] Portable URL : ${PORTABLE_URL:-not found}"
-echo "[MangaJaNai] Setup URL    : ${SETUP_URL:-not found}"
-
-find_and_copy_models() {
-    local search_root="$1"
-
-    export SEARCH_ROOT="${search_root}"
-    export MODELS_DIR
-
-    "${PY}" - <<'PY'
-import os
-import shutil
-from pathlib import Path
-
-root = Path(os.environ["SEARCH_ROOT"])
-dst = Path(os.environ["MODELS_DIR"])
-
-candidates = []
-
-for p in root.rglob("models"):
-    if not p.is_dir():
-        continue
-
-    # Prefer the official backend/models layout.
-    if p.parent.name == "backend":
-        candidates.append(p)
-
-# Fallback: any model-looking directory containing common weights.
-if not candidates:
-    for p in root.rglob("models"):
-        if not p.is_dir():
-            continue
-        model_files = [
-            q for q in p.rglob("*")
-            if q.is_file() and q.suffix.lower() in {".pth", ".pt", ".safetensors", ".onnx"}
-        ]
-        if model_files:
-            candidates.append(p)
-
-if not candidates:
-    raise SystemExit(2)
-
-def file_count(path):
-    return sum(1 for q in path.rglob("*") if q.is_file())
-
-src = max(candidates, key=file_count)
-print(f"[MangaJaNai] Found bundled models at: {src}")
-
-if dst.exists():
-    shutil.rmtree(dst)
-
-dst.parent.mkdir(parents=True, exist_ok=True)
-shutil.copytree(src, dst)
-
-files = [q for q in dst.rglob("*") if q.is_file()]
-print(f"[MangaJaNai] Copied {len(files)} files")
-
-if not files:
-    raise SystemExit(3)
-PY
-}
-
-MODELS_FOUND=0
-
-# First try the Portable ZIP (simplest archive to extract).
-if [[ -n "${PORTABLE_URL}" ]]; then
-    log "Trying latest Portable ZIP for bundled models"
-
-    if curl -fL \
-        --retry 5 \
-        --retry-delay 3 \
-        --connect-timeout 30 \
-        -o "${TMP_DIR}/portable.zip" \
-        "${PORTABLE_URL}"; then
-
-        mkdir -p "${TMP_DIR}/portable"
-        if unzip -q "${TMP_DIR}/portable.zip" -d "${TMP_DIR}/portable"; then
-            if find_and_copy_models "${TMP_DIR}/portable"; then
-                MODELS_FOUND=1
-            fi
-        fi
+    if [[ -s "${dest}" ]] && unzip -tq "${dest}" >/dev/null 2>&1; then
+        echo "[MangaJaNai] Reusing cached ${label}: ${dest}"
+        return 0
     fi
-fi
 
-# Official Linux README explicitly says models can be extracted from
-# the release .exe, so use the Setup EXE as a fallback.
-if [[ "${MODELS_FOUND}" -ne 1 && -n "${SETUP_URL}" ]]; then
-    log "Portable archive did not expose models; trying official Setup EXE"
+    rm -f "${dest}"
+
+    echo "[MangaJaNai] Downloading ${label}"
+    echo "[MangaJaNai] URL: ${url}"
 
     curl -fL \
-        --retry 5 \
+        --retry 8 \
         --retry-delay 3 \
+        --retry-all-errors \
         --connect-timeout 30 \
-        -o "${TMP_DIR}/setup.exe" \
-        "${SETUP_URL}"
+        --speed-time 60 \
+        --speed-limit 1024 \
+        -o "${dest}.part" \
+        "${url}"
 
-    mkdir -p "${TMP_DIR}/setup_extracted"
-    7z x -y \
-        -o"${TMP_DIR}/setup_extracted" \
-        "${TMP_DIR}/setup.exe" >/dev/null
+    mv -f "${dest}.part" "${dest}"
 
-    if find_and_copy_models "${TMP_DIR}/setup_extracted"; then
-        MODELS_FOUND=1
+    unzip -tq "${dest}" >/dev/null 2>&1 || {
+        rm -f "${dest}"
+        die "Downloaded archive is corrupt: ${label}"
+    }
+}
+
+extract_model_archive() {
+    local archive="$1"
+    local label="$2"
+    local tmp_extract
+
+    tmp_extract="$(mktemp -d)"
+
+    echo "[MangaJaNai] Extracting ${label}"
+    unzip -q -o "${archive}" -d "${tmp_extract}"
+
+    local copied=0
+    while IFS= read -r -d '' model_file; do
+        cp -f "${model_file}" "${MODELS_DIR}/$(basename "${model_file}")"
+        ((copied += 1))
+    done < <(
+        find "${tmp_extract}" -type f \
+            \( -iname '*.pth' -o -iname '*.pt' -o -iname '*.safetensors' -o -iname '*.onnx' \) \
+            -print0
+    )
+
+    rm -rf "${tmp_extract}"
+
+    if [[ "${copied}" -eq 0 ]]; then
+        die "No model files found inside ${label}"
     fi
+
+    echo "[MangaJaNai] Copied ${copied} model file(s) from ${label}"
+}
+
+download_zip \
+    "${MANGA_MODELS_URL}" \
+    "${MANGA_ZIP}" \
+    "MangaJaNai V1 manga model archive"
+
+extract_model_archive \
+    "${MANGA_ZIP}" \
+    "MangaJaNai V1 manga model archive"
+
+if [[ "${MANGAJANAI_INCLUDE_ILLUSTRATION}" == "1" ]]; then
+    download_zip \
+        "${ILLUSTRATION_MODELS_URL}" \
+        "${ILLUSTRATION_ZIP}" \
+        "IllustrationJaNai V1 model archive"
+
+    extract_model_archive \
+        "${ILLUSTRATION_ZIP}" \
+        "IllustrationJaNai V1 model archive"
+else
+    echo "[MangaJaNai] Skipping IllustrationJaNai models (MANGAJANAI_INCLUDE_ILLUSTRATION=${MANGAJANAI_INCLUDE_ILLUSTRATION})"
 fi
 
-[[ "${MODELS_FOUND}" -eq 1 ]] || die \
-    "Could not extract MangaJaNai models from the latest official release assets"
+# The official MangaJaNai V1 release has seven target-height models
+# for 2x and another seven for 4x. Verify all 14 explicitly so that
+# provisioning cannot silently succeed with an incomplete model set.
+EXPECTED_MANGA_MODELS=(
+    "2x_MangaJaNai_1200p_V1_ESRGAN_70k.pth"
+    "2x_MangaJaNai_1300p_V1_ESRGAN_75k.pth"
+    "2x_MangaJaNai_1400p_V1_ESRGAN_70k.pth"
+    "2x_MangaJaNai_1500p_V1_ESRGAN_90k.pth"
+    "2x_MangaJaNai_1600p_V1_ESRGAN_90k.pth"
+    "2x_MangaJaNai_1920p_V1_ESRGAN_70k.pth"
+    "2x_MangaJaNai_2048p_V1_ESRGAN_95k.pth"
+    "4x_MangaJaNai_1200p_V1_ESRGAN_70k.pth"
+    "4x_MangaJaNai_1300p_V1_ESRGAN_75k.pth"
+    "4x_MangaJaNai_1400p_V1_ESRGAN_105k.pth"
+    "4x_MangaJaNai_1500p_V1_ESRGAN_105k.pth"
+    "4x_MangaJaNai_1600p_V1_ESRGAN_70k.pth"
+    "4x_MangaJaNai_1920p_V1_ESRGAN_105k.pth"
+    "4x_MangaJaNai_2048p_V1_ESRGAN_70k.pth"
+)
+
+MISSING_MODELS=0
+for model_name in "${EXPECTED_MANGA_MODELS[@]}"; do
+    if [[ ! -s "${MODELS_DIR}/${model_name}" ]]; then
+        echo "[MangaJaNai] MISSING: ${model_name}" >&2
+        MISSING_MODELS=1
+    fi
+done
+
+[[ "${MISSING_MODELS}" -eq 0 ]] || die \
+    "MangaJaNai model installation is incomplete"
+
+echo "[MangaJaNai] Verified all 14 official MangaJaNai V1 manga models."
+
+if [[ "${MANGAJANAI_INCLUDE_ILLUSTRATION}" == "1" ]]; then
+    for model_name in \
+        "4x_IllustrationJaNai_V1_ESRGAN_135k.pth" \
+        "4x_IllustrationJaNai_V1_DAT2_190k.pth"
+    do
+        [[ -s "${MODELS_DIR}/${model_name}" ]] || die \
+            "IllustrationJaNai model missing after extraction: ${model_name}"
+    done
+    echo "[MangaJaNai] Verified IllustrationJaNai V1 models."
+fi
 
 # ------------------------------------------------------------
 # 6. Create simple launcher
@@ -374,16 +359,20 @@ PY
 
 "${ROOT}/mangajanai.sh" -h >/dev/null
 
-MODEL_COUNT="$(find "${MODELS_DIR}" -type f | wc -l | tr -d ' ')"
+MODEL_COUNT="$(
+    find "${MODELS_DIR}" -maxdepth 1 -type f \
+        \( -iname '*.pth' -o -iname '*.pt' -o -iname '*.safetensors' -o -iname '*.onnx' \) \
+        | wc -l | tr -d ' '
+)"
 
 log "DONE"
-
 echo "[MangaJaNai] Root       : ${ROOT}"
 echo "[MangaJaNai] Backend    : ${BACKEND_SRC}"
 echo "[MangaJaNai] Models     : ${MODELS_DIR}"
 echo "[MangaJaNai] Model files: ${MODEL_COUNT}"
 echo "[MangaJaNai] Input      : ${INPUT_DIR}"
 echo "[MangaJaNai] Output     : ${OUTPUT_DIR}"
+echo "[MangaJaNai] Downloads  : ${DOWNLOAD_DIR}"
 echo
 echo "Example:"
 echo "  ${ROOT}/mangajanai.sh -d ${INPUT_DIR} -o ${OUTPUT_DIR}"
